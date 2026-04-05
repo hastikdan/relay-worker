@@ -1,0 +1,24 @@
+{
+  "name": "relay-init",
+  "version": "0.1.0",
+  "description": "Set up the Relay Cloudflare Worker for your site in under 5 minutes",
+  "bin": {
+    "relay-init": "./bin/relay-init.js"
+  },
+  "main": "./lib/index.js",
+  "scripts": {
+    "test": "node bin/relay-init.js --dry-run"
+  },
+  "keywords": ["relay", "cloudflare", "worker", "ai", "agents", "publisher"],
+  "license": "MIT",
+  "dependencies": {
+    "prompts": "^2.4.2",
+    "chalk":   "^5.3.0",
+    "ora":     "^8.0.1",
+    "execa":   "^8.0.1"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "type": "module"
+}
