@@ -30,7 +30,7 @@ const { default: prompts } = await import('prompts');
 const { default: ora }     = await import('ora');
 const { execa }            = await import('execa');
 
-const RELAY_API_URL   = 'https://relay-backend.onrender.com';
+const RELAY_API_URL   = 'https://relay-backend-7dip.onrender.com';
 const WORKER_REPO     = 'https://github.com/hastikdan/relay-worker.git';
 const WORKER_DIR_NAME = 'relay-worker';
 
