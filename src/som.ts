@@ -36,11 +36,13 @@ export interface SOMPublisher {
 }
 
 export interface SOMRelay {
-  served_at: string;
-  agent_name: string;
-  request_id: string;
+  served_at:        string;
+  agent_name:       string;
+  request_id:       string;
   cost_saved_bytes: number;
-  format_version: string;
+  format_version:   string;
+  discovery_method: string;  // how SOM was requested: agent-detected | accept-header | query-param
+  content_hash:     string;  // SHA-256 of body content — detect poisoning / verify integrity
 }
 
 export interface SOMDocument {
@@ -141,17 +143,24 @@ function wordCount(text: string): number {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 export interface SOMGeneratorOptions {
-  publisherId: string;
-  publisherName: string;
-  licensePolicy: string;
-  licenseUrl: string;
-  agentName: string;
-  requestId: string;
-  requestUrl: string;
-  originalBytes: number;
+  publisherId:     string;
+  publisherName:   string;
+  licensePolicy:   string;
+  licenseUrl:      string;
+  agentName:       string;
+  requestId:       string;
+  requestUrl:      string;
+  originalBytes:   number;
+  discoveryMethod: string;
 }
 
-export function generateSOM(html: string, opts: SOMGeneratorOptions): SOMDocument {
+async function sha256Hex(text: string): Promise<string> {
+  const buf = new TextEncoder().encode(text);
+  const digest = await crypto.subtle.digest("SHA-256", buf);
+  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+export async function generateSOM(html: string, opts: SOMGeneratorOptions): Promise<SOMDocument> {
   const jsonld = extractJsonLd(html);
 
   const title =
@@ -194,13 +203,14 @@ export function generateSOM(html: string, opts: SOMGeneratorOptions): SOMDocumen
     extractOG(html, "url") ||
     opts.requestUrl;
 
-  const body = extractArticleBody(html).slice(0, 50000); // hard cap at 50k chars
-  const wc = wordCount(body);
-  const somBytes = JSON.stringify({ body }).length;
+  const body       = extractArticleBody(html).slice(0, 50000); // hard cap at 50k chars
+  const wc         = wordCount(body);
+  const somBytes   = JSON.stringify({ body }).length;
   const bytesSaved = Math.max(0, opts.originalBytes - somBytes);
+  const hash       = await sha256Hex(body);
 
   return {
-    relay_version: "1.0",
+    relay_version: "SOM/1.0",
     url: opts.requestUrl,
     canonical,
     publisher: {
@@ -217,12 +227,12 @@ export function generateSOM(html: string, opts: SOMGeneratorOptions): SOMDocumen
       updated_at,
       language,
       body,
-      word_count:             wc,
-      reading_time_minutes:   Math.max(1, Math.round(wc / 238)),
+      word_count:           wc,
+      reading_time_minutes: Math.max(1, Math.round(wc / 238)),
     },
     metadata: {
-      topics:    [], // future: NLP topic extraction
-      paywall:   html.includes("paywall") || html.includes("subscribe-wall"),
+      topics:   [], // future: NLP topic extraction
+      paywall:  html.includes("paywall") || html.includes("subscribe-wall"),
       canonical,
     },
     relay: {
@@ -231,6 +241,8 @@ export function generateSOM(html: string, opts: SOMGeneratorOptions): SOMDocumen
       request_id:       opts.requestId,
       cost_saved_bytes: bytesSaved,
       format_version:   "SOM/1.0",
+      discovery_method: opts.discoveryMethod,
+      content_hash:     hash,  // SHA-256 of body — verify integrity, detect poisoning
     },
   };
 }

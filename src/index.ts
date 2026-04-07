@@ -4,24 +4,63 @@
  * Sits between AI agents and your origin server.
  *
  * Request flow:
- *   1. Detect if request is from an AI agent
- *   2. If agent: check publisher's license policy
- *      - blocked      → return 403 + license info
- *      - som_enabled  → serve SOM JSON (fetch origin HTML, transform, cache in KV)
- *      - html fallback → pass through to origin unchanged
- *   3. If human: pass through to origin immediately
- *   4. Log analytics event async (never blocks response)
+ *   1. Check if SOM is explicitly requested via content negotiation:
+ *      - Accept: application/som+json header
+ *      - ?format=som query param
+ *   2. Detect if request is from a known AI agent (UA-based)
+ *   3. If neither agent nor explicit SOM request (human):
+ *      - Pass through to origin
+ *      - Add Link header for passive SOM discovery
+ *   4. If agent or explicit SOM request: check publisher config
+ *      - blocked      → return 403 + license JSON
+ *      - som_enabled  → serve SOM (fetch origin, transform, cache in KV)
+ *      - html fallback → pass through + Link header
+ *   5. Log analytics event async (never blocks response)
+ *
+ * SOM discovery headers added to ALL HTML responses:
+ *   Link: <url?format=som>; rel="semantic-representation"; type="application/som+json"
  *
  * Environment variables (set via wrangler.toml + wrangler secret):
- *   RELAY_API_URL      — https://relay-backend.onrender.com
- *   RELAY_API_KEY      — rly_... publisher API key
- *   SOM_CACHE_TTL_SEC  — SOM KV cache TTL in seconds (default: 300)
+ *   RELAY_API_URL        — https://relay-backend-7dip.onrender.com
+ *   RELAY_API_KEY        — rly_... publisher API key
+ *   SOM_CACHE_TTL_SEC    — SOM KV cache TTL in seconds (default: 300)
  *   CONFIG_CACHE_TTL_SEC — publisher config re-fetch interval (default: 60)
  */
 
-import { detectAgent }              from "./detector";
-import { generateSOM, SOMDocument } from "./som";
-import { sendEvents, RelayEvent }   from "./analytics";
+import { detectAgent }                        from "./detector";
+import { generateSOM, SOMDocument }           from "./som";
+import { sendEvents, RelayEvent }             from "./analytics";
+
+export type DiscoveryMethod = "agent-detected" | "accept-header" | "query-param";
+
+/**
+ * Returns the discovery method if SOM should be served, null otherwise.
+ * Priority: explicit query param > explicit Accept header > agent detection.
+ */
+function getSOMDiscoveryMethod(request: Request, isAgent: boolean): DiscoveryMethod | null {
+  const url    = new URL(request.url);
+  const accept = request.headers.get("Accept") || "";
+  if (url.searchParams.get("format") === "som") return "query-param";
+  if (accept.includes("application/som+json"))   return "accept-header";
+  if (isAgent)                                   return "agent-detected";
+  return null;
+}
+
+/**
+ * Adds the Link: rel="semantic-representation" header to a response.
+ * Enables passive SOM discovery by any HTTP client.
+ */
+function withDiscoveryHeader(response: Response, requestUrl: string): Response {
+  const u      = new URL(requestUrl);
+  const somUrl = `${u.origin}${u.pathname}?format=som`;
+  const headers = new Headers(response.headers);
+  headers.set("Link", `<${somUrl}>; rel="semantic-representation"; type="application/som+json"`);
+  return new Response(response.body, {
+    status:     response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
 
 // ── Env interface ─────────────────────────────────────────────────────────────
 export interface Env {
@@ -100,21 +139,28 @@ export default {
       return fetch(request);
     }
 
-    // ── Detect agent ────────────────────────────────────────────────────────
-    const detection = detectAgent(request);
+    // ── Detect agent + content negotiation ──────────────────────────────────
+    const detection       = detectAgent(request);
+    const discoveryMethod = getSOMDiscoveryMethod(request, detection.isAgent);
 
-    if (!detection.isAgent) {
-      // Human traffic — pass through immediately, no logging
-      return fetch(request);
+    if (!discoveryMethod) {
+      // Human traffic — pass through, add Link header for passive discovery
+      const originRes = await fetch(request);
+      const ct = originRes.headers.get("content-type") || "";
+      if (ct.includes("text/html")) {
+        return withDiscoveryHeader(originRes, request.url);
+      }
+      return originRes;
     }
 
-    // ── Agent detected — get publisher config ────────────────────────────────
+    // ── SOM requested (agent or explicit) — get publisher config ────────────
     let config: PublisherConfig;
     try {
       config = await getPublisherConfig(env);
     } catch {
-      // Config fetch failed — fail open (pass through to origin)
-      return fetch(request);
+      // Config fetch failed — fail open (pass through + discovery header)
+      const originRes = await fetch(request);
+      return withDiscoveryHeader(originRes, request.url);
     }
 
     const latencyMs = Date.now() - startMs;
@@ -180,15 +226,16 @@ export default {
         originalBytes = new TextEncoder().encode(html).length;
 
         // 3. Generate SOM
-        som = generateSOM(html, {
-          publisherId:   config.publisher_id,
-          publisherName: config.domain,
-          licensePolicy: config.license_policy,
-          licenseUrl:    config.license_url || "",
-          agentName:     detection.agent.name,
+        som = await generateSOM(html, {
+          publisherId:    config.publisher_id,
+          publisherName:  config.domain,
+          licensePolicy:  config.license_policy,
+          licenseUrl:     config.license_url || "",
+          agentName:      detection.agent.name,
           requestId,
-          requestUrl:    pageUrl,
+          requestUrl:     pageUrl,
           originalBytes,
+          discoveryMethod,
         });
 
         // 4. Cache it
@@ -219,39 +266,47 @@ export default {
       return new Response(somJson, {
         status: 200,
         headers: {
-          "Content-Type":       "application/json; charset=utf-8",
-          "X-Relay-Served":     "true",
-          "X-Relay-Format":     "SOM/1.0",
-          "X-Relay-Publisher":  config.publisher_id,
-          "X-Relay-License":    config.license_policy,
-          "X-Relay-Request-Id": requestId,
-          "Cache-Control":      "no-store",
+          "Content-Type":          "application/som+json; charset=utf-8",
+          "X-Relay-Served":        "true",
+          "X-Relay-Format":        "SOM/1.0",
+          "X-Relay-Publisher":     config.publisher_id,
+          "X-Relay-License":       config.license_policy,
+          "X-Relay-Request-Id":    requestId,
+          "X-Relay-Discovery":     discoveryMethod,
+          "Cache-Control":         "no-store",
+          "Vary":                  "Accept",
         },
       });
     }
 
-    // ── HTML pass-through (SOM disabled) ──────────────────────────────────────
+    // ── HTML pass-through (SOM disabled or non-HTML) ─────────────────────────
     const originRes    = await fetch(request);
     const cloned       = originRes.clone();
     const html         = await cloned.text();
     const bytesServed  = new TextEncoder().encode(html).length;
 
     const event: RelayEvent = {
-      request_id:    requestId,
-      agent_name:    detection.agent.name,
-      agent_tier:    detection.agent.tier,
-      agent_ua:      detection.rawUa,
-      page_url:      pageUrl,
-      page_path:     pagePath,
-      bytes_served:  bytesServed,
-      bytes_saved:   0,
-      format_served: "html",
-      latency_ms:    Date.now() - startMs,
+      request_id:       requestId,
+      agent_name:       detection.agent.name,
+      agent_tier:       detection.agent.tier,
+      agent_ua:         detection.rawUa,
+      page_url:         pageUrl,
+      page_path:        pagePath,
+      bytes_served:     bytesServed,
+      bytes_saved:      0,
+      format_served:    "html",
+      discovery_method: discoveryMethod,
+      latency_ms:       Date.now() - startMs,
       country,
-      timestamp:     new Date().toISOString(),
+      timestamp:        new Date().toISOString(),
     };
     ctx.waitUntil(sendEvents([event], env.RELAY_API_URL, env.RELAY_API_KEY));
 
+    // Add discovery Link header so agents can learn about SOM next time
+    const ct = originRes.headers.get("content-type") || "";
+    if (ct.includes("text/html")) {
+      return withDiscoveryHeader(originRes, request.url);
+    }
     return originRes;
   },
 };
